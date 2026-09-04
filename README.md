@@ -1,28 +1,82 @@
-需搭配 [kookxiang/jellyfin-plugin-bangumi](https://github.com/kookxiang/jellyfin-plugin-bangumi) 使用。
+# jellyfin-nfo-generator
 
-`Python 3.10` `requests`
+通过 [Bangumi](https://bgm.tv) API 为本地动漫视频文件生成 Jellyfin 兼容的 NFO 元数据文件，配合 [jellyfin-plugin-bangumi](https://github.com/kookxiang/jellyfin-plugin-bangumi) 使用。
 
-为了便于判断番剧的年份和季度，我为番剧文件夹命名的方式是 `番剧名 (YYYYQX)`，所以通常情况下插件无法正确获取到番剧名。并且我也不太能接受为了让 Jellyfin 能够自动刮削去重命名视频文件。
+**纯 Python 标准库实现，无需安装第三方依赖。**
 
-因为不同压制组或字幕组的命名规则也有所不同，`jellyfin-plugin-bangumi` 插件即使启用 `使用 AnitomySharp 猜测集数` 也有难以做到精确的时候。
+## 为什么需要这个？
 
-使用这个脚本，就可以在媒体库扫描前通过 nfo 文件预定义 `<bangumiid>`，再配合 `jellyfin-plugin-bangumi` 插件的 `始终根据配置的 Bangumi ID 获取元数据` 就能总是根据已绑定的 `subject_id` 或 `episode_id` 获取到对应番剧或剧集的元数据。
+- 番剧文件夹命名为 `番剧名 (YYYYQX)` 时，Jellyfin 插件无法正确识别番剧名
+- 不同压制组/字幕组的文件命名规则各异，AnitomySharp 难以精确匹配集数
+- 不想为了自动刮削而重命名视频文件
 
-以下为假设和我一样是**每一个季度都算做一个番剧**的话，因为 Bangumi 就是这样的。
+本脚本通过在媒体库扫描前预写 NFO 文件中的 `<bangumiid>`，配合插件的「始终根据配置的 Bangumi ID 获取元数据」功能，确保每集都能正确匹配。
 
-脚本依赖 `Python 3.10` 和 `requests`，更早版本的未测试，以实际运行情况为准。
+## 环境要求
 
-脚本启动时会先通过 Bangumi 进行用户验证，故启动前需要先在脚本中填写自己的 `APP_ID` 和 `APP_SECRET`，在 [Bangumi 开发者平台](https://bgm.tv/dev/app) 新建一个应用并获取。
+- Python 3.10+
+- 无需安装任何第三方包
 
-验证完成后，向命令行界面输入**于根含有番剧视频文件的**目录绝对路径，便会
-1. 尝试从文件夹名匹配番剧名。
-1. 通过调用 Bangumi API 匹配番剧和话数，有多个搜索结果时交互地进行选取。
-1. 保存到对应 nfo 文件（番剧信息 `tvshow.nfo`；剧集信息 `剧集文件名.nfo`）。
+## 快速开始
 
-对于季度第一话不为 `ep.01` 的情况，会使用自动偏置及交互地修正的方式进行处理。
+1. 在 [Bangumi 开发者平台](https://bgm.tv/dev/app) 创建应用，获取 `APP_ID` 和 `APP_SECRET`
+2. 填写到脚本顶部的对应变量中
+3. 运行脚本：
 
-对于生成 nfo 文件时提示权限不足的情况，可能是于容器运行的 Jellyfin 使用更高权限更早生成了 nfo 文件，将会跳过生成。
+```bash
+python jellyfin-nfo-generator.py
+```
 
-用户验证信息会以 `bangumi.json` 保存到脚本的运行路径，以在下一次运行时判断是否需要从头进行用户验证，或者仅自动刷新续期授权。
+4. 首次运行会自动打开浏览器进行 OAuth 授权
+5. 输入番剧目录的绝对路径，例如：
 
-对于此处未能解释详尽的地方，请以源代码为准。对于 Bangumi API 的信息，请以 [bangumi/api](https://github.com/bangumi/api) 为准。
+```
+请输入番剧目录路径：D:\Anime\别当欧尼酱了 (2023Q4)
+```
+
+## 功能特性
+
+### NFO 生成
+
+- 根据文件夹名自动搜索 Bangumi 番剧
+- 生成 `tvshow.nfo`（番剧信息）和各集 `.nfo`（剧集信息）
+- 自动处理季度首话不为 ep.01 的偏移情况
+- 单集剧场版等特殊情况自动识别
+- 支持多种文件名格式的集数提取（`[01]`、`第01话`、`#01` 等）
+
+### 字幕规范化
+
+检测目录下的字幕文件，自动提示将非标准命名转换为 Jellyfin 语言代码：
+
+| 原后缀 | → | 目标 | 说明 |
+|---|---|---|---|
+| `.sc` | → | `.zh` | 简体中文 |
+| `.chs` | → | `.zh` | 简体中文 |
+| `.scjp` | → | `.zh` | 简中+日文 |
+| `.tc` | → | `.zh-Hant` | 繁体中文 |
+| `.cht` | → | `.zh-Hant` | 繁体中文 |
+
+## 文件命名建议
+
+建议番剧文件夹命名为 `番剧名 (YYYYQX)` 格式，例如：
+
+```
+别当欧尼酱了 (2023Q4)
+├── tvshow.nfo
+├── [SubGroup] Don't Become an Otaku... [01] [1080p].mkv
+├── [SubGroup] Don't Become an Otaku... [01] [1080p].nfo
+├── [SubGroup] Don't Become an Otaku... [02] [1080p].mkv
+├── [SubGroup] Don't Become an Otaku... [02] [1080p].nfo
+└── ...
+```
+
+## 注意事项
+
+- 用户认证信息保存在脚本运行目录下的 `bangumi.json`，下次启动时自动刷新
+- 如果 Jellyfin 容器以更高权限运行并已生成 NFO，脚本会因权限不足跳过对应文件
+- 集数匹配失败时会列出未能匹配的集数，可手动检查文件名格式
+
+## 相关项目
+
+- [jellyfin-plugin-bangumi](https://github.com/kookxiang/jellyfin-plugin-bangumi) — Jellyfin Bangumi 元数据插件
+- [Bangumi API](https://github.com/bangumi/api) — Bangumi API 文档

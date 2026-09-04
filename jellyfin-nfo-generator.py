@@ -1,56 +1,154 @@
-from dataclasses import dataclass
+"""Bangumi → Jellyfin NFO 生成器
+
+通过 Bangumi (bgm.tv) API 查询番剧信息，为本地视频文件生成 Jellyfin 兼容的 NFO 元数据。
+仅使用 Python 标准库，无需安装第三方依赖。
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sys
+from dataclasses import dataclass, field
+from html import escape as html_escape
 from http.server import SimpleHTTPRequestHandler
-from json import dump, load
 from pathlib import Path
-from re import search
-from re import sub as re_sub
 from socketserver import TCPServer
 from threading import Thread
 from time import time
-from urllib.parse import quote, urlparse
+from typing import Optional
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode, quote, urlparse
+from urllib.request import Request, urlopen
 from webbrowser import open_new_tab
 
-from requests import get, post
-from requests.exceptions import JSONDecodeError
-
+# ── Bangumi OAuth ──────────────────────────────────────────────────
 APP_ID = ""  # https://bgm.tv/dev/app
 APP_SECRET = ""
 
 if not APP_ID or not APP_SECRET:
     print("在 https://bgm.tv/dev/app 创建应用并填写 APP_ID 和 APP_SECRET。")
-    exit()
+    sys.exit(1)
 
-HEADERS = {"User-Agent": "Lancercmd/jellyfin-nfo-generator"}
-URL = "https://bgm.tv", "https://api.bgm.tv"
-OAUTH_AUTHORIZE = URL[0] + "/oauth/authorize"
-OAUTH_ACCESS_TOKEN = URL[0] + "/oauth/access_token"
-OAUTH_TOKEN_STATUS = URL[0] + "/oauth/token_status"
-API_SEARCH_SUBJECT = URL[1] + "/search/subject"
-API_SUBJECT = URL[1] + "/subject"
-API_SUBJECT_EP = API_SUBJECT + "/{}/ep"
+HEADERS: dict[str, str] = {"User-Agent": "Lancercmd/jellyfin-nfo-generator"}
+_BASE_WEB = "https://bgm.tv"
+_BASE_API = "https://api.bgm.tv"
+
+OAUTH_AUTHORIZE = f"{_BASE_WEB}/oauth/authorize"
+OAUTH_ACCESS_TOKEN = f"{_BASE_WEB}/oauth/access_token"
+OAUTH_TOKEN_STATUS = f"{_BASE_WEB}/oauth/token_status"
+API_SEARCH_SUBJECT = f"{_BASE_API}/search/subject"
+API_SUBJECT = f"{_BASE_API}/subject"
+API_SUBJECT_EP = f"{API_SUBJECT}/{{}}/ep"
 
 PORT = 8001
-STATE = None
+
+# ── 支持的视频扩展名 ──────────────────────────────────────────────
+VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".rmvb", ".flv", ".wmv", ".ts"}
+
+# ── 字幕文件规范化 ────────────────────────────────────────────────
+SUBTITLE_EXTENSIONS = {".ass", ".ssa", ".srt", ".sub", ".vtt"}
+# 需要重命名的后缀 → Jellyfin 标准语言代码
+SUBTITLE_RENAME_MAP = {
+    ".sc": ".zh",      # Simplified Chinese → Chinese
+    ".chs": ".zh",     # Chinese Simplified → Chinese
+    ".scjp": ".zh",    # Simplified Chinese + Japanese → Chinese
+    ".tc": ".zh-Hant", # Traditional Chinese
+    ".cht": ".zh-Hant",
+}
+
+# ── 集数提取正则 ──────────────────────────────────────────────────
+EPISODE_PATTERNS = [
+    # [01], [01v2], [01 END], [OAD01], [OVA01], [SP01]
+    re.compile(r"\[(?P<prefix>OAD|OVA|SP)?(?P<ep>[\d.]{2,4})\s?(?P<suffix>v\d|END)?\]"),
+    # S01 - 01 , S01 - OVA01
+    re.compile(r"(?:S\d{2})?\s*-\s*(?P<prefix>OAD|OVA|SP)?(?P<ep>[\d.]{2,4})\s"),
+    # 第01话, 第01集, 第01話
+    re.compile(r"第(?P<ep>[\d.]{2,4})[话話集]"),
+    # 01 [ (standalone number followed by bracket)
+    re.compile(r"(?P<prefix>OAD|OVA|SP)?(?P<ep>[\d.]{2,4})\s*\["),
+    # bare number: 01, 001
+    re.compile(r"(?P<prefix>OAD|OVA|SP)?(?P<ep>[\d.]{2,4})$"),
+    # #01
+    re.compile(r"#(?P<ep>[\d.]{1,3})\s"),
+]
+
+# ── 状态持久化 ────────────────────────────────────────────────────
+STATE: Optional[dict] = None
 STATE_PATH = Path("bangumi.json")
+
 if STATE_PATH.exists():
-    with STATE_PATH.open() as f:
-        STATE = load(f)
+    try:
+        STATE = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"⚠ 读取 {STATE_PATH} 失败: {exc}，将重新认证。")
+        STATE = None
 
 
-def init():
-    if not STATE or is_expired():
+# ── HTTP 工具（标准库） ───────────────────────────────────────────
+def _http_get(url: str, params: Optional[dict] = None, timeout: int = 15) -> dict:
+    """发送 GET 请求并返回 JSON。"""
+    if params:
+        url = f"{url}?{urlencode(params)}"
+    req = Request(url, headers=HEADERS, method="GET")
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except HTTPError as exc:
+        print(f"❌ 请求失败 ({url}): HTTP {exc.code} {exc.reason}")
+        return {}
+    except (URLError, OSError) as exc:
+        print(f"❌ 请求失败 ({url}): {exc}")
+        return {}
+    except json.JSONDecodeError:
+        print(f"❌ JSON 解析失败 ({url})")
+        return {}
+
+
+def _http_post(url: str, data: dict, timeout: int = 15) -> dict:
+    """发送 POST 请求并返回 JSON。"""
+    body = urlencode(data).encode("utf-8")
+    headers = {**HEADERS, "Content-Type": "application/x-www-form-urlencoded"}
+    req = Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        print(f"❌ 请求失败 ({url}): HTTP {exc.code} — {error_body}")
+        return {}
+    except (URLError, OSError) as exc:
+        print(f"❌ 请求失败 ({url}): {exc}")
+        return {}
+    except json.JSONDecodeError:
+        print(f"❌ JSON 解析失败 ({url})")
+        return {}
+
+
+# ── OAuth ──────────────────────────────────────────────────────────
+def init() -> None:
+    """初始化 OAuth 认证，获取或刷新 access_token。"""
+    global STATE
+
+    if STATE is None or _is_expired():
 
         class Handler(SimpleHTTPRequestHandler):
-            def do_GET(self):
+            def do_GET(self_inner) -> None:
                 global STATE
-                self.send_response(200)
-                self.send_header("Content-type", "text/html")
-                self.end_headers()
+                self_inner.send_response(200)
+                self_inner.send_header("Content-type", "text/html; charset=utf-8")
+                self_inner.end_headers()
 
-                if self.path.startswith("/?code="):
-                    Thread(target=self.server.shutdown).start()
-                    code = urlparse(self.path).query.split("=")[1]
-                    authorization_code(code)
+                if self_inner.path.startswith("/?code="):
+                    Thread(target=self_inner.server.shutdown, daemon=True).start()
+                    code = urlparse(self_inner.path).query.split("=", 1)[1]
+                    _authorization_code(code)
+                    self_inner.wfile.write("✅ 认证成功，可以关闭此页面。".encode("utf-8"))
+                else:
+                    self_inner.wfile.write("等待 OAuth 回调…".encode("utf-8"))
+
+            def log_message(self_inner, format, *args) -> None:
+                pass  # 静默 HTTP 日志
 
         with TCPServer(("", PORT), Handler) as httpd:
             data = {
@@ -58,15 +156,19 @@ def init():
                 "response_type": "code",
                 "redirect_uri": f"http://localhost:{PORT}",
             }
-            query_s = "&".join([f"{k}={v}" for k, v in data.items()])
-            open_new_tab(f"{OAUTH_AUTHORIZE}?{query_s}")
+            query_s = "&".join(f"{k}={v}" for k, v in data.items())
+            url = f"{OAUTH_AUTHORIZE}?{query_s}"
+            print(f"🌐 正在打开浏览器进行认证…\n   {url}")
+            open_new_tab(url)
             httpd.serve_forever()
     else:
-        refresh_token()
+        _refresh_token()
+
     HEADERS["Authorization"] = f'{STATE["token_type"]} {STATE["access_token"]}'
+    print("✅ 认证完成。")
 
 
-def authorization_code(code: str):
+def _authorization_code(code: str) -> None:
     global STATE
     data = {
         "grant_type": "authorization_code",
@@ -75,17 +177,22 @@ def authorization_code(code: str):
         "code": code,
         "redirect_uri": f"http://localhost:{PORT}",
     }
-    STATE = post(OAUTH_ACCESS_TOKEN, data=data, headers=HEADERS).json()
-    update_state()
+    STATE = _http_post(OAUTH_ACCESS_TOKEN, data)
+    if STATE:
+        _update_state()
+    else:
+        print("❌ 授权失败。")
+        sys.exit(1)
 
 
-def update_state():
+def _update_state() -> None:
     STATE["expires"] = int(time()) + STATE["expires_in"]
-    with STATE_PATH.open("w") as f:
-        dump(STATE, f, ensure_ascii=False, indent=4)
+    STATE_PATH.write_text(
+        json.dumps(STATE, ensure_ascii=False, indent=4), encoding="utf-8"
+    )
 
 
-def refresh_token():
+def _refresh_token() -> None:
     global STATE
     data = {
         "grant_type": "refresh_token",
@@ -93,88 +200,185 @@ def refresh_token():
         "client_secret": APP_SECRET,
         "refresh_token": STATE["refresh_token"],
     }
-    STATE = post(OAUTH_ACCESS_TOKEN, data=data, headers=HEADERS).json()
-    update_state()
+    result = _http_post(OAUTH_ACCESS_TOKEN, data)
+    if result:
+        STATE = result
+        _update_state()
+        print("🔄 Token 已刷新。")
+    else:
+        print("❌ 刷新 Token 失败，请重新运行以重新认证。")
+        STATE = None
+        sys.exit(1)
 
 
-def token_status():
+def _token_status() -> dict:
     data = {"access_token": STATE["access_token"]}
-    return post(OAUTH_TOKEN_STATUS, data=data, headers=HEADERS).json()
+    return _http_post(OAUTH_TOKEN_STATUS, data, timeout=10)
 
 
-def is_expired():
-    expires = token_status()["expires"]
-    return expires < time()
+def _is_expired() -> bool:
+    try:
+        status = _token_status()
+        return status.get("expires", 0) < time()
+    except Exception:
+        return True
 
 
-def search_subject(keyword: str):
+# ── Bangumi API ───────────────────────────────────────────────────
+def search_subject(keyword: str) -> Optional[dict]:
+    """按关键词搜索番剧，返回用户选择的条目。"""
     data = {"type": 2}
     url = f"{API_SEARCH_SUBJECT}/{quote(keyword)}"
-    resp: dict = get(url, params=data, headers=HEADERS).json()
-    l = resp.get("list")
-    if l:
-        for i in l:
-            i["name"] = str(i["name"]).replace("&amp;", "&")
-            i["name_cn"] = str(i["name_cn"]).replace("&amp;", "&")
-            if i["name"] == keyword or i["name_cn"] == keyword:
-                return i
-        l_ = [(k, v) for k, v in enumerate(l, 1)]
-        q = "\n".join([f"{k}. {v['name_cn'] or v['name']}" for k, v in l_])
-        return l_[int(input(f"{q}\n找到多个番剧，请选择：")) - 1][1]
+    resp = _http_get(url, data)
+    items = resp.get("list")
+
+    if not items:
+        print(f"🔍 未找到与「{keyword}」相关的番剧。")
+        return None
+
+    # 处理 HTML 实体
+    for item in items:
+        item["name"] = str(item["name"]).replace("&amp;", "&")
+        item["name_cn"] = str(item["name_cn"]).replace("&amp;", "&")
+
+    # 精确匹配优先
+    for item in items:
+        if item["name"] == keyword or item["name_cn"] == keyword:
+            return item
+
+    # 多个结果 → 交互选择
+    print(f"\n找到 {len(items)} 个结果：")
+    for idx, item in enumerate(items, 1):
+        display = item["name_cn"] or item["name"]
+        air_date = item.get("air_date", "未知")
+        print(f"  {idx}. {display}  ({air_date})")
+
+    while True:
+        try:
+            choice = input(f"\n请选择 (1-{len(items)})，直接回车取消：").strip()
+            if not choice:
+                return None
+            n = int(choice)
+            if 1 <= n <= len(items):
+                return items[n - 1]
+            print(f"请输入 1-{len(items)} 之间的数字。")
+        except ValueError:
+            print("请输入有效的数字。")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
 
 
-def get_subject(sid: str):
-    return get(API_SUBJECT + f"/{sid}", headers=HEADERS).json()
+def get_subject(subject_id: str) -> dict:
+    return _http_get(f"{API_SUBJECT}/{subject_id}")
 
 
-def get_subject_ep(sid: str):
-    return get(API_SUBJECT_EP.format(sid), headers=HEADERS).json()
+def get_episodes(subject_id: str) -> list[dict]:
+    resp = _http_get(API_SUBJECT_EP.format(subject_id))
+    return resp.get("eps", [])
 
 
-def get_showtitle(sid: str) -> str:
-    resp: dict = get_subject(sid)
+def get_showtitle(subject_id: str) -> str:
+    resp = get_subject(subject_id)
     if resp.get("type") == 2:
-        return resp["name_cn"] or resp["name"]
-    else:
-        print(resp)
+        return resp.get("name_cn") or resp.get("name", subject_id)
+    return resp.get("name_cn") or resp.get("name", subject_id)
 
 
-def get_episodes(sid: str) -> list[dict]:
-    resp = get_subject_ep(sid)
-    return resp["eps"]
+# ── 视频文件扫描 ──────────────────────────────────────────────────
+def list_all_videos(directory: Path) -> list[Path]:
+    """列出目录下所有视频文件，按文件名排序。"""
+    videos = [
+        f
+        for f in directory.iterdir()
+        if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS
+    ]
+    videos.sort(key=lambda f: f.name)
+    return videos
 
 
-def get_episodes_count(sid: str):
-    return len(get_episodes(sid))
+# ── 字幕文件规范化 ────────────────────────────────────────────────
+def _find_subtitles_to_rename(directory: Path) -> list[tuple[Path, str]]:
+    """查找需要规范命名的字幕文件。
+
+    Returns:
+        [(原始路径, 新文件名), ...]
+    """
+    renames: list[tuple[Path, str]] = []
+    for f in directory.iterdir():
+        if not f.is_file():
+            continue
+        stem_lower = f.stem.lower()
+        for suffix, target in SUBTITLE_RENAME_MAP.items():
+            if stem_lower.endswith(suffix):
+                new_name = f.stem[: -len(suffix)] + target + f.suffix
+                renames.append((f, new_name))
+                break
+    return renames
 
 
-def list_all_videos(p: Path):
-    return (
-        list(p.glob("*.mp4"))
-        + list(p.glob("*.mkv"))
-        + list(p.glob("*.avi"))
-        + list(p.glob("*.rmvb"))
-    )
+def _preview_and_rename_subtitles(renames: list[tuple[Path, str]]) -> None:
+    """预览字幕重命名计划，询问用户确认后执行。"""
+    if not renames:
+        return
+
+    print(f"\n📝 检测到 {len(renames)} 个字幕文件需要规范命名：")
+    print("-" * 60)
+    for old_path, new_name in renames:
+        print(f"  {old_path.name}")
+        print(f"    → {new_name}")
+    print("-" * 60)
+
+    try:
+        choice = input("是否执行重命名？(y/N): ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+
+    if choice not in ("y", "yes"):
+        print("⏭ 跳过字幕重命名。")
+        return
+
+    renamed_count = 0
+    for old_path, new_name in renames:
+        new_path = old_path.parent / new_name
+        try:
+            old_path.rename(new_path)
+            renamed_count += 1
+            print(f"  ✅ {old_path.name} → {new_name}")
+        except OSError as exc:
+            print(f"  ⚠ 重命名失败 {old_path.name}: {exc}")
+
+    print(f"  完成，共重命名 {renamed_count}/{len(renames)} 个字幕文件。")
+
+
+# ── NFO 数据类 ────────────────────────────────────────────────────
+def _xml_escape(text: str) -> str:
+    """转义 XML 特殊字符。"""
+    return html_escape(str(text), quote=False)
 
 
 @dataclass
 class Base:
-    def __post_init__(self):
+    content: str = field(init=False, default="")
+
+    def __post_init__(self) -> None:
         self.content = '<?xml version="1.0" encoding="utf-8" standalone="yes"?>'
 
 
 @dataclass
 class TVShow(Base):
     bangumiid: str  # subject_id
-    title: str = None
+    title: Optional[str] = None
     season: str = "-1"
     episode: str = "-1"
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         super().__post_init__()
+        resolved_title = self.title or get_showtitle(self.bangumiid)
         self.content += "<tvshow>"
-        self.content += f"<title>{self.title or get_showtitle(self.bangumiid)}</title>"
-        self.content += f"<bangumiid>{self.bangumiid}</bangumiid>"
+        self.content += f"<title>{_xml_escape(resolved_title)}</title>"
+        self.content += f"<bangumiid>{_xml_escape(self.bangumiid)}</bangumiid>"
         self.content += f"<season>{self.season}</season>"
         self.content += f"<episode>{self.episode}</episode>"
         self.content += "</tvshow>"
@@ -182,108 +386,160 @@ class TVShow(Base):
 
 @dataclass
 class Episode(Base):
-    bangumiid: str  # episode_id
-    showtitle: str = None
-    episode: str = None
+    bangumiid: str  # episode id
+    showtitle: Optional[str] = None
+    episode: Optional[str] = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         super().__post_init__()
         self.content += "<episodedetails>"
-        self.content += f"<bangumiid>{self.bangumiid}</bangumiid>"
+        self.content += f"<bangumiid>{_xml_escape(self.bangumiid)}</bangumiid>"
         if self.showtitle:
-            self.content += f"<title>{self.showtitle}</title>"
+            self.content += f"<title>{_xml_escape(self.showtitle)}</title>"
         if self.episode:
             self.content += f"<episode>{self.episode}</episode>"
         self.content += "</episodedetails>"
 
 
-if __name__ == "__main__":
+# ── 集数提取 ──────────────────────────────────────────────────────
+def _extract_episode(filename_stem: str) -> Optional[str]:
+    """从文件名中提取集数，返回原始字符串（如 '01', '01.5'）。"""
+    for pattern in EPISODE_PATTERNS:
+        match = pattern.search(filename_stem)
+        if match:
+            return match.group("ep")
+    return None
+
+
+def _write_nfo(path: Path, content: str) -> bool:
+    """写入 NFO 文件，返回是否成功。"""
+    try:
+        path.write_text(content, encoding="utf-8-sig")
+        return True
+    except PermissionError:
+        print(f"  ⚠ 权限不足，无法创建 {path.name}")
+        return False
+    except OSError as exc:
+        print(f"  ⚠ 写入 {path.name} 失败: {exc}")
+        return False
+
+
+# ── 主流程 ────────────────────────────────────────────────────────
+def process_directory(directory: Path) -> None:
+    """处理单个番剧目录：生成 tvshow.nfo 和各集 nfo。"""
+    videos = list_all_videos(directory)
+    if not videos:
+        print("📂 路径下没有视频文件。")
+        return
+
+    # 从目录名提取番剧名（去掉年份等后缀）
+    name = directory.name.split(" (", 1)[0]
+    subject = search_subject(name)
+    if subject is None:
+        return
+
+    subject_id = subject["id"]
+    show_title = subject["name_cn"] or subject["name"]
+    print(f"📺 找到番剧：{subject_id} - {show_title}")
+
+    # tvshow.nfo
+    nfo_tvshow = directory / "tvshow.nfo"
+    _write_nfo(nfo_tvshow, TVShow(subject_id, title=show_title).content)
+    print(f"  ✅ {nfo_tvshow.name}")
+
+    # 获取集数列表
+    eps = get_episodes(subject_id)
+    if not eps:
+        print("  ⚠ 无法获取集数信息。")
+        return
+
+    print(f"  共 {len(eps)} 话，{len(videos)} 个视频文件。")
+
+    # 处理集数偏移
+    offset = 0
+    if eps[0]["sort"] not in (0, 1):
+        offset = int(1 - eps[0]["sort"])
+        print(f"  ℹ 第一话为 ep.{eps[0]['sort']}，自动偏移量：{offset}")
+        try:
+            c_ = input("  直接回车应用，或输入整数偏移量：").strip()
+            if c_:
+                if c_.lstrip("-").isdigit():
+                    offset = int(c_)
+                else:
+                    print("  ⚠ 无效输入，使用默认偏移量。")
+        except (EOFError, KeyboardInterrupt):
+            print()
+
+    # 为每个视频匹配集数
+    matched = 0
+    missing: list[str] = []
+
+    for ep_info in eps:
+        ep_sort = ep_info["sort"]
+        success = False
+
+        for video in videos:
+            extracted = _extract_episode(video.stem)
+            if extracted is None:
+                continue
+
+            target = str(ep_sort + offset).zfill(6)
+            if extracted.zfill(6) == target or (len(eps) == len(videos) == 1):
+                # 匹配成功（或单集剧场版）
+                success = True
+                nfo_path = directory / f"{video.stem}.nfo"
+                _write_nfo(nfo_path, Episode(ep_info["id"]).content)
+                matched += 1
+                pct = round(matched / len(videos) * 100, 1)
+                print(f"\r  处理 {matched}/{len(videos)} ({pct}%)", end="", flush=True)
+                break
+
+        if not success:
+            missing.append(ep_sort)
+
+    print()  # 换行
+
+    if missing:
+        print(f"  ⚠ 未能匹配到以下集数：{', '.join(str(m) for m in missing)}")
+
+    # 字幕文件规范化
+    subtitle_renames = _find_subtitles_to_rename(directory)
+    _preview_and_rename_subtitles(subtitle_renames)
+
+    print("  ✅ 完成。")
+
+
+def main() -> None:
+    print("=" * 50)
+    print("  Bangumi → Jellyfin NFO 生成器")
+    print("=" * 50)
+
     init()
+
     while True:
         try:
-            p = Path(re_sub(r"^(\"|\')|(\"|\')$", "", input("请输入路径：")))
-            if not p.exists():
-                print("路径不存在。")
+            raw = input("\n请输入番剧目录路径：").strip().strip("\"'")
+            if not raw:
                 continue
-            videos = list_all_videos(p)
-            if not videos:
-                print("路径下没有视频文件。")
+
+            directory = Path(raw)
+            if not directory.exists():
+                print("❌ 路径不存在。")
                 continue
-            name = p.name.split(" (", 1)[0]
-            subject = search_subject(name)
-            id = subject["id"]
-            name = subject["name_cn"] or subject["name"]
-            print(f"找到番剧：{id}", name)
-            n0 = p / "tvshow.nfo"
-            try:
-                n0.write_text(TVShow(id, title=name).content, encoding="utf-8-sig")
-            except PermissionError:
-                print(f"无法创建 {n0.name} 文件，权限不足。")
-            eps = get_episodes(id)
-            print(f"共 {len(eps)} 话，路径下有 {len(videos)} 个视频文件。")
-            pattern = "|".join(
-                [
-                    r"\[(?P<prefix1>OAD|OVA|SP)?(?P<ep1>[\d\.]{2,4}) ?(?P<suffix>v[0-9]|END)?\]",
-                    r"(?:S\d\d)? - (?P<prefix2>OAD|OVA|SP)?(?P<ep2>[\d\.]{2,4}) ",
-                    r"第(?P<ep3>[\d\.]{2,4})[话話集]",
-                    r" (?P<prefix4>OAD|OVA|SP)?(?P<ep4>[\d\.]{2,4}) \[",
-                    r"(?P<prefix5>OAD|OVA|SP)?(?P<ep5>[\d\.]{2,4})",
-                ]
-            )
-            n = 0
-            missing = []
-            offset = 0
-            if not eps[0]["sort"] in (0, 1):
-                offset = int(1 - eps[0]["sort"])
-                print(
-                    f"来自 bgm.tv 的第一话是 ep.{eps[0]['sort']}，自动应用偏移量：{offset}"
-                )
-                c_ = input("直接回车以应用，输入数字以更改偏移量（整数）：")
-                if c_.isdigit() or (c_.startswith("-") and c_[1:].isdigit()):
-                    offset = int(c_)
-                elif c_:
-                    print("无效输入，应用默认偏移量。")
-            for i in eps:
-                success = False
-                for f in videos:
-                    res = search(pattern, f.stem).groupdict()
-                    ep = (
-                        res.get("ep1")
-                        or res.get("ep2")
-                        or res.get("ep3")
-                        or res.get("ep4")
-                        or res.get("ep5")
-                    )
-                    if (
-                        ep.zfill(6) == str(i["sort"] + offset).zfill(6)
-                        or len(eps) == len(videos) == 1  # 针对剧场版等单集情况
-                    ):
-                        success = True
-                        n1 = p / f"{f.stem}.nfo"
-                        try:
-                            n1.write_text(
-                                Episode(i["id"]).content,
-                                encoding="utf-8-sig",
-                            )
-                        except PermissionError:
-                            print(f"无法创建 {n1.name} 文件，权限不足。")
-                        n += 1
-                        if n == len(videos):
-                            print(
-                                f"处理 {n}/{len(videos)} ({round(n/len(videos)*100, 2)}%)  "
-                            )
-                        else:
-                            print(
-                                f"处理 {n}/{len(videos)} ({round(n/len(videos)*100, 2)}%)  ",
-                                end="\r",
-                            )
-                if not success:
-                    missing.append(i["sort"])
-            if missing:
-                for i in missing:
-                    print(f"未能匹配到第 {i} 话。")
-            print("完成。")
+            if not directory.is_dir():
+                print("❌ 路径不是一个目录。")
+                continue
+
+            process_directory(directory)
+
         except KeyboardInterrupt:
-            exit()
-        except JSONDecodeError as e:
-            print(e)
+            print("\n👋 再见！")
+            break
+        except json.JSONDecodeError as exc:
+            print(f"❌ JSON 解析错误: {exc}")
+        except Exception as exc:
+            print(f"❌ 未预期的错误: {exc}")
+
+
+if __name__ == "__main__":
+    main()
